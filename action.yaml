@@ -1,0 +1,76 @@
+name: Deploy Android Application
+description: Builds and deploys an Android application to Google Play
+
+inputs:
+  keystore:
+    description: Base64-encoded keystore
+    required: true
+
+  keyAlias:
+    description: Key alias
+    required: true
+
+  keyPassword:
+    description: Key password
+    required: true
+
+  serviceAccount:
+    description: Base64-encoded service account key
+    required: true
+
+  keystorePassword:
+    description: Keystore password
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Write Keystore
+      shell: bash
+      run: |
+        KEYSTORE_PATH="$RUNNER_TEMP/keystore"
+        echo -n "${{ inputs.keystore }}" | base64 --decode > $KEYSTORE_PATH
+        echo "KEYSTORE_PATH=$KEYSTORE_PATH" >> $GITHUB_ENV
+
+    - name: Create Release Bundle
+      shell: bash
+      run: |
+        ./gradlew bundle --no-daemon \
+          -Pandroid.injected.signing.store.file="$KEYSTORE_PATH" \
+          -Pandroid.injected.signing.store.password="${{ inputs.keystorePassword }}" \
+          -Pandroid.injected.signing.key.alias="${{ inputs.keyAlias }}" \
+          -Pandroid.injected.signing.key.password="${{ inputs.keyPassword }}"
+
+    - name: Set Application ID
+      shell: bash
+      run: |
+        APPLICATION_ID=$(sed -n 's/.*package="\([^"]*\)".*/\1/p' \
+          app/build/intermediates/bundle_manifest/release/processApplicationManifestReleaseForBundle/AndroidManifest.xml)
+        echo "APPLICATION_ID=$APPLICATION_ID" >> $GITHUB_ENV
+
+    - name: Create Service Account Token
+      shell: bash
+      run: |
+        export GOOGLE_APPLICATION_CREDENTIALS="$RUNNER_TEMP/service-account.json"
+        echo -n "${{ inputs.serviceAccount }}" | base64 --decode > $GOOGLE_APPLICATION_CREDENTIALS
+        GOOGLE_TOKEN=$(gcloud auth application-default print-access-token --scopes='https://www.googleapis.com/auth/androidpublisher')
+
+        echo "::add-mask::$GOOGLE_TOKEN" 
+        echo "GOOGLE_TOKEN=$GOOGLE_TOKEN" >> $GITHUB_ENV
+
+    - name: Upload Bundle
+      shell: bash
+      run: |
+        # Create a new edit
+        EDIT_ID=$(curl -X POST -s https://androidpublisher.googleapis.com/androidpublisher/v3/applications/${{ env.APPLICATION_ID }}/edits \
+          -H "Authorization: Bearer ${{ env.GOOGLE_TOKEN }}" | jq -r '.id')
+
+        # Upload the AAB
+        curl -X POST -s https://androidpublisher.googleapis.com/upload/androidpublisher/v3/applications/${{ env.APPLICATION_ID }}/edits/$EDIT_ID/bundles \
+          --data-binary "@app/build/outputs/bundle/release/app-release.aab" \
+          -H "Content-Type: application/octet-stream" \
+          -H "Authorization: Bearer ${{ env.GOOGLE_TOKEN }}"
+
+        # Commit the edit
+        curl -X POST -s https://androidpublisher.googleapis.com/androidpublisher/v3/applications/${{ env.APPLICATION_ID }}/edits/$EDIT_ID:commit \
+          -H "Authorization: Bearer ${{ env.GOOGLE_TOKEN }}"
